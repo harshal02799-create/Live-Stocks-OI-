@@ -1,14 +1,18 @@
-EXPIRY = "30-Mar-2026"   # 🔥 CHANGE EXPIRY WHEN NEEDED
-
-
 
 import streamlit as st
+st.set_page_config(layout="wide")
+st.title("🔥 Stocks OI (Auto 5 Min Scanner)")
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from datetime import datetime, timedelta
+from datetime import datetime
+import pytz
 import streamlit.components.v1 as components
+
+
+EXPIRY = "30-Mar-2026"   # 🔥 CHANGE EXPIRY WHEN NEEDED
 # ==============================
 # MANUAL DATA (PASTE COMPLETE LIST)
 # ==============================
@@ -184,7 +188,7 @@ st.markdown("""
 st.markdown("""
 <style>
 
-/* Page background */
+/*  background */
 body {
     background-color: #0f172a;
 }
@@ -489,8 +493,6 @@ def scan_all(symbols, lot_dict):
 # 300000 ms = 5 minutes
 st_autorefresh(interval=300000, key="datarefresh")
 
-st.set_page_config(layout="wide")
-st.title("🔥 NSE OI Breakout Dashboard (Auto 5 Min Scanner)")
 lot_df = load_lot_size()
 
 if lot_df.empty:
@@ -589,9 +591,9 @@ for symbol in list(st.session_state.breakout_tracker.keys()):
 
         del st.session_state.breakout_tracker[symbol]
 
-from datetime import datetime, timedelta
 
-now = datetime.now()
+ist = pytz.timezone("Asia/Kolkata")
+now = datetime.now(ist)
 
 # Market live check (9:15 to 3:30 IST)
 market_open = now.replace(hour=9, minute=15, second=0)
@@ -1527,6 +1529,7 @@ with col2:
 #     if not squat_df.empty:
 #         st.markdown("### ⚠️ Failed Breakouts")
 #         components.html(render_table(squat_df, "failed"), height=350)
+
 
 
 
