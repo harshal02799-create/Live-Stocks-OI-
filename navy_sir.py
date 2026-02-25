@@ -1,24 +1,84 @@
-
 import streamlit as st
 st.set_page_config(layout="wide")
-st.title("🔥 Stocks OI (Auto 5 Min Scanner)")
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from datetime import datetime
-import pytz
 import streamlit.components.v1 as components
+import sqlite3
+import os
 
+# ==========================================
+# CREATE DATABASE & TABLE
+# ==========================================
 
-EXPIRY = "30-Mar-2026"   # 🔥 CHANGE EXPIRY WHEN NEEDED
+def init_database():
+    conn = sqlite3.connect("oi_snapshot.db")
+    cursor = conn.cursor()
+
+    # ==============================
+    # TABLE 1: FULL SNAPSHOT
+    # ==============================
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS option_snapshot (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        symbol TEXT,
+        ltp REAL,
+        strike REAL,
+        option_type TEXT,
+        oi INTEGER,
+        oi_change INTEGER,
+        volume INTEGER,
+        day_high REAL,
+        day_low REAL
+    )
+    """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_time ON option_snapshot(symbol, timestamp)")
+
+    # ==============================
+    # TABLE 2: MAX OI SUMMARY
+    # ==============================
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS max_oi_summary (
+        timestamp TEXT,
+        symbol TEXT,
+        ce_strike_1 REAL,
+        ce_strike_2 REAL,
+        ce_strike_3 REAL,
+        pe_strike_1 REAL,
+        pe_strike_2 REAL,
+        pe_strike_3 REAL,
+        ce_max_oi INTEGER,
+        pe_max_oi INTEGER
+    )
+    """)
+
+    # ==============================
+    # TABLE 3: BREAKOUT STATE
+    # ==============================
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS breakout_status (
+        symbol TEXT PRIMARY KEY,
+        last_status TEXT,
+        breakout_time TEXT,
+        trap_flag INTEGER,
+        reentry_allowed INTEGER
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+init_database()
+
 # ==============================
 # MANUAL DATA (PASTE COMPLETE LIST)
 # ==============================
 
+EXPIRY = "30-Mar-2026"   # 🔥 CHANGE EXPIRY WHEN NEEDED7
 
-st.markdown("""
+st.markdown(""" 
 <style>
 
 /* ===== FULL BLACK BACKGROUND ===== */
@@ -108,7 +168,7 @@ div[data-testid="stAlert"] {
 /* OI value color */
 .money {
     font-weight: 600;
-    color: #ffd700;
+    color: #0000FF;
 }
 
 /* ===== LIVE BAR ===== */
@@ -188,7 +248,7 @@ st.markdown("""
 st.markdown("""
 <style>
 
-/*  background */
+/* Page background */
 body {
     background-color: #0f172a;
 }
@@ -250,12 +310,6 @@ body {
 
 </style>
 """, unsafe_allow_html=True)
-
-# ==============================
-# CREATE DATAFRAME
-# ==============================
-
-
 
 # ==========================================
 # CONFIG
@@ -333,21 +387,65 @@ def get_option_chain(symbol):
     except:
         return None
 
+def store_full_snapshot(symbol, data):
+
+    conn = sqlite3.connect("oi_snapshot.db")
+    cursor = conn.cursor()
+
+    now = datetime.now()
+
+    # 🔥 Round to 5-minute candle
+    rounded_minute = (now.minute // 5) * 5
+    timestamp = now.replace(minute=rounded_minute, second=0, microsecond=0)
+    timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 🔥 Prevent duplicate insert
+    cursor.execute("""
+        SELECT 1 FROM option_snapshot 
+        WHERE symbol=? AND timestamp=? LIMIT 1
+    """, (symbol, timestamp_str))
+
+    if cursor.fetchone():
+        conn.close()
+        return  # Already stored
+
+    records = data["records"]["data"]
+    ltp = data["records"]["underlyingValue"]
+
+    for item in records:
+        strike = item.get("strikePrice")
+
+        for side in ["CE", "PE"]:
+            option = item.get(side)
+            if option:
+
+                cursor.execute("""
+                INSERT INTO option_snapshot
+                (timestamp, symbol, ltp, strike, option_type, oi, oi_change, volume, day_high, day_low)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    timestamp_str,
+                    symbol,
+                    ltp,
+                    strike,
+                    side,
+                    option.get("openInterest", 0),
+                    option.get("changeinOpenInterest", 0),
+                    option.get("totalTradedVolume", 0),
+                    option.get("highPrice", 0),
+                    option.get("lowPrice", 0)
+                ))
+
+    conn.commit()
+    conn.close()
+
 # ==========================================
 # ANALYZE OI
 # ==========================================
 
-def analyze_oi(symbol):
-    data = get_option_chain(symbol)
+def calculate_top3(symbol, data):
 
-    if data is None:
-        return None
-
-    try:
-        records = data["records"]["data"]
-        ltp = data["records"]["underlyingValue"]
-    except:
-        return None
+    records = data["records"]["data"]
 
     rows = []
 
@@ -365,21 +463,15 @@ def analyze_oi(symbol):
 
     df = pd.DataFrame(rows)
 
-    if df.empty:
-        return None
-
-    max_ce_row = df.loc[df["CE_OI"].idxmax()]
-    max_pe_row = df.loc[df["PE_OI"].idxmax()]
+    ce_sorted = df.sort_values("CE_OI", ascending=False).head(3)
+    pe_sorted = df.sort_values("PE_OI", ascending=False).head(3)
 
     return {
-        "symbol": symbol,
-        "ltp": ltp,
-        "max_ce_strike": max_ce_row["strike"],
-        "max_ce_oi": max_ce_row["CE_OI"],
-        "max_pe_strike": max_pe_row["strike"],
-        "max_pe_oi": max_pe_row["PE_OI"]
+        "ce_strikes": ce_sorted["strike"].tolist(),
+        "pe_strikes": pe_sorted["strike"].tolist(),
+        "ce_max": ce_sorted.iloc[0]["CE_OI"],
+        "pe_max": pe_sorted.iloc[0]["PE_OI"]
     }
-
 # ==========================================
 # BREAKOUT CHECK
 # ==========================================
@@ -420,18 +512,81 @@ def load_lot_size():
         st.error(f"Error loading lot size file: {e}")
         return pd.DataFrame()
 
+
+def analyze_oi(symbol):
+    data = get_option_chain(symbol)
+
+    if data is None:
+        return None
+
+    try:
+        records = data["records"]["data"]
+        ltp = data["records"]["underlyingValue"]
+    except:
+        return None
+
+    rows = []
+
+    for item in records:
+        strike = item.get("strikePrice")
+
+        ce_oi = item.get("CE", {}).get("openInterest", 0)
+        pe_oi = item.get("PE", {}).get("openInterest", 0)
+
+        rows.append({
+            "strike": strike,
+            "CE_OI": ce_oi,
+            "PE_OI": pe_oi
+        })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return None
+
+    ce_sorted = df.sort_values("CE_OI", ascending=False).head(3)
+    pe_sorted = df.sort_values("PE_OI", ascending=False).head(3)
+
+    return {
+        "symbol": symbol,
+        "ltp": ltp,
+
+        # CE
+        "ce_strike": ce_sorted.iloc[0]["strike"],
+        "ce_oi": ce_sorted.iloc[0]["CE_OI"],
+
+        "ce_strike_1": ce_sorted.iloc[1]["strike"] if len(ce_sorted) > 1 else None,
+        "ce_oi_1": ce_sorted.iloc[1]["CE_OI"] if len(ce_sorted) > 1 else 0,
+
+        "ce_strike_2": ce_sorted.iloc[2]["strike"] if len(ce_sorted) > 2 else None,
+        "ce_oi_2": ce_sorted.iloc[2]["CE_OI"] if len(ce_sorted) > 2 else 0,
+
+        # PE
+        "pe_strike": pe_sorted.iloc[0]["strike"],
+        "pe_oi": pe_sorted.iloc[0]["PE_OI"],
+
+        "pe_strike_1": pe_sorted.iloc[1]["strike"] if len(pe_sorted) > 1 else None,
+        "pe_oi_1": pe_sorted.iloc[1]["PE_OI"] if len(pe_sorted) > 1 else 0,
+
+        "pe_strike_2": pe_sorted.iloc[2]["strike"] if len(pe_sorted) > 2 else None,
+        "pe_oi_2": pe_sorted.iloc[2]["PE_OI"] if len(pe_sorted) > 2 else 0,
+    }
 # ==========================================
 # SCAN ALL STOCKS
 # ==========================================
+
+import time
 
 def scan_all(symbols, lot_dict):
 
     bullish_rows = []
     bearish_rows = []
 
-
-
+    # 🔥 Define process function FIRST
     def process_symbol(symbol):
+
+        time.sleep(0.15)  # Avoid NSE rate limiting
+
         result = analyze_oi(symbol)
         if result is None:
             return None
@@ -439,31 +594,40 @@ def scan_all(symbols, lot_dict):
         ltp = result["ltp"]
         lot_size = lot_dict.get(symbol, 0)
 
-        # Bullish
-        if ltp > result["max_ce_strike"]:
-            total_value = result["max_ce_oi"] * lot_size
-
+        # Bullish breakout
+        if ltp > result["ce_strike"]:
             return ("bullish", {
                 "Symbol": symbol,
                 "LTP": ltp,
-                "Strike": result["max_ce_strike"],
-                "OI Value": result["max_ce_oi"],
+
+                "Strike": result["ce_strike"],
+                "OI (L)": result["ce_oi"] * lot_size,
+
+                "Strike 1": result["ce_strike_1"],
+                "OI_1 (L)": result["ce_oi_1"] * lot_size,
+
+                "Strike 2": result["ce_strike_2"],
+                "OI_2 (L)": result["ce_oi_2"] * lot_size,
+
                 "Lot Size": lot_size,
-                "Total OI Value": total_value,
                 "Sentiment": "Bullish"
             })
-
-        # Bearish
-        if ltp < result["max_pe_strike"]:
-            total_value = result["max_pe_oi"] * lot_size
-
+        # Bearish breakdown
+        if ltp < result["pe_strike"]:
             return ("bearish", {
                 "Symbol": symbol,
                 "LTP": ltp,
-                "Strike": result["max_pe_strike"],
-                "OI Value": result["max_pe_oi"],
+
+                "Strike": result["pe_strike"],
+                "OI (L)": result["pe_oi"] * lot_size,
+
+                "Strike 1": result["pe_strike_1"],
+                "OI_1 (L)": result["pe_oi_1"] * lot_size,
+
+                "Strike 2": result["pe_strike_2"],
+                "OI_2 (L)": result["pe_oi_2"] * lot_size,
+
                 "Lot Size": lot_size,
-                "Total OI Value": total_value,
                 "Sentiment": "Bearish"
             })
 
@@ -485,7 +649,6 @@ def scan_all(symbols, lot_dict):
 
     return pd.DataFrame(bullish_rows), pd.DataFrame(bearish_rows)
 
-
 # ==========================================
 # AUTO REFRESH EVERY 5 MINUTES
 # ==========================================
@@ -493,6 +656,8 @@ def scan_all(symbols, lot_dict):
 # 300000 ms = 5 minutes
 st_autorefresh(interval=300000, key="datarefresh")
 
+
+st.title("🔥 NSE OI Breakout Dashboard (Auto 5 Min Scanner)")
 lot_df = load_lot_size()
 
 if lot_df.empty:
@@ -569,40 +734,63 @@ for _, row in bullish_df.iterrows():
 # Check failed breakouts
 for symbol in list(st.session_state.breakout_tracker.keys()):
 
+    # If symbol no longer in bullish list → possible failure
     if symbol not in bullish_df["Symbol"].values:
 
         stored_strike = st.session_state.breakout_tracker[symbol]["strike"]
 
-        result = analyze_oi(symbol)
+        conn = sqlite3.connect("oi_snapshot.db")
+        cursor = conn.cursor()
 
-        if result:
-            current_ltp = result["ltp"]
+        # 🔥 Get latest snapshot row
+        cursor.execute("""
+        SELECT ltp 
+        FROM option_snapshot
+        WHERE symbol=?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """, (symbol,))
 
-            if current_ltp < stored_strike:
-                squat_stocks.append({
-                    "Symbol": symbol,
-                    "LTP": current_ltp,
-                    "Strike": stored_strike,
-                    "OI Value": result["max_ce_oi"],
-                    "Lot Size": lot_dict.get(symbol, 0),
-                    "Total OI Value": result["max_ce_oi"] * lot_dict.get(symbol, 0),
-                    "Sentiment": "Failed"
-                })
+        row = cursor.fetchone()
+        conn.close()
 
+        if not row:
+            continue
+
+        current_ltp = row[0]
+
+        # 🔥 Squat Condition
+        if current_ltp < stored_strike:
+
+            squat_stocks.append({
+                "Symbol": symbol,
+                "LTP": current_ltp,
+                "Strike": stored_strike,
+                "OI Value": 0,  # optional: you can fetch max OI if needed
+                "Lot Size": lot_dict.get(symbol, 0),
+                "Total OI Value": 0,
+                "Sentiment": "Failed"
+            })
+
+        # Remove from breakout tracker
         del st.session_state.breakout_tracker[symbol]
 
 
-ist = pytz.timezone("Asia/Kolkata")
-now = datetime.now(ist)
+from datetime import datetime, timedelta
 
-# Market live check (9:15 to 3:30 IST)
+now = datetime.now()
+
 market_open = now.replace(hour=9, minute=15, second=0)
-market_close = now.replace(hour=15, minute=30, second=0)
+market_close = now.replace(hour=23, minute=59, second=0)
 
 is_live = market_open <= now <= market_close
 
-live_color = "#22c55e" if is_live else "#ef4444"
-live_text = "🟢 LIVE" if is_live else "🔴 MARKET CLOSED"
+if not is_live:
+    st.warning("Market Closed")
+    st.stop()
+
+live_color = "#22c55e"
+live_text = "🟢 LIVE"
 
 st.markdown("""
 <style>
@@ -750,9 +938,12 @@ def render_table(df, sentiment_type):
                 <th>Symbol</th>
                 <th>LTP</th>
                 <th>Strike</th>
-                <th>OI</th>
+                <th>OI (L)</th>
+                <th>Strike 1</th>
+                <th>OI_1 (L)</th>
+                <th>Strike 2</th>
+                <th>OI_2 (L)</th>
                 <th>Lot</th>
-                <th>OI in lakhs</th>
                 <th>Sentiment</th>
             </tr>
         </thead>
@@ -773,10 +964,17 @@ def render_table(df, sentiment_type):
         <tr>
             <td><strong>{row['Symbol']}</strong></td>
             <td>{row['LTP']:.2f}</td>
+            
             <td>{row['Strike']}</td>
-            <td>{int(row['OI Value']):,}</td>
+            <td class="money">{round(row['OI (L)'] / 100000, 2)}</td>
+            
+            <td>{row.get('Strike 1','')}</td>
+            <td class="money">{round(row.get('OI_1 (L)',0) / 100000, 2)}</td>
+            
+            <td>{row.get('Strike 2','')}</td>
+            <td class="money">{round(row.get('OI_2 (L)',0) / 100000, 2)}</td>
+            
             <td>{row['Lot Size']}</td>
-            <td class="money">{round(row['Total OI Value'] / 100000, 2)}</td>
             <td><span class="{badge_class}">{row.get('Sentiment','')}</span></td>
         </tr>
         """
@@ -789,41 +987,193 @@ def render_table(df, sentiment_type):
 
     return table_html
 
+
+
+def get_last_two_timestamps():
+    conn = sqlite3.connect("oi_snapshot.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT DISTINCT timestamp 
+    FROM option_snapshot
+    ORDER BY timestamp DESC
+    LIMIT 2
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    if len(rows) < 2:
+        return None, None
+
+    return rows[0][0], rows[1][0]   # current, previous
+
+
+def calculate_oi_change(symbol, option_type, current_ts, previous_ts):
+
+    conn = sqlite3.connect("oi_snapshot.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT strike, oi 
+    FROM option_snapshot
+    WHERE symbol=? AND option_type=? AND timestamp=?
+    """, (symbol, option_type, current_ts))
+
+    current_data = cursor.fetchall()
+
+    cursor.execute("""
+    SELECT strike, oi 
+    FROM option_snapshot
+    WHERE symbol=? AND option_type=? AND timestamp=?
+    """, (symbol, option_type, previous_ts))
+
+    prev_data = cursor.fetchall()
+
+    conn.close()
+
+    if not current_data or not prev_data:
+        return []
+
+    df_current = pd.DataFrame(current_data, columns=["strike", "oi"])
+    df_prev = pd.DataFrame(prev_data, columns=["strike", "oi"])
+
+    merged = df_current.merge(df_prev, on="strike", suffixes=("_cur", "_prev"))
+
+    merged["oi_change"] = merged["oi_cur"] - merged["oi_prev"]
+
+    return merged.sort_values("oi_change", ascending=False)
+
+
 # ==============================
 # DISPLAY TABLES SIDE BY SIDE
 # ==============================
 
-import streamlit.components.v1 as components
+
 fresh_df = pd.DataFrame(new_breakouts) if new_breakouts else pd.DataFrame()
 squat_df = pd.DataFrame(squat_stocks) if squat_stocks else pd.DataFrame()
 fresh_breakdown_df = pd.DataFrame(fresh_breakdowns) if fresh_breakdowns else pd.DataFrame()
 
-col1, col2 = st.columns(2)
+tab1, tab2 = st.tabs(["🚀 OI Breakout ", "📊 OI BUILD UP"])
 
-with col1:
+with tab1:
+
+    # =========================
+    # Bullish Breakouts
+    # =========================
     st.markdown("### 📈 Bullish Breakouts")
-    components.html(render_table(bullish_df, "bullish"), height=450)
+    components.html(render_table(bullish_df, "bullish"), height=420)
 
-    if not fresh_df.empty:
+    if isinstance(fresh_df, pd.DataFrame) and not fresh_df.empty:
         st.markdown("### 🚀 Fresh Breakouts")
-        components.html(render_table(fresh_df, "fresh"), height=350)
+        components.html(render_table(fresh_df, "fresh"), height=420)
 
-with col2:
+    # =========================
+    # Bearish Breakdowns
+    # =========================
     st.markdown("### 📉 Bearish Breakdowns")
-    components.html(render_table(bearish_df, "bearish"), height=450)
+    components.html(render_table(bearish_df, "bearish"), height=420)
 
-    if not fresh_breakdown_df.empty:
+    if isinstance(fresh_breakdown_df, pd.DataFrame) and not fresh_breakdown_df.empty:
         st.markdown("### 🔻 Fresh Breakdowns")
-        components.html(render_table(fresh_breakdown_df, "bearish"), height=350)
+        components.html(render_table(fresh_breakdown_df, "bearish"), height=420)
 
-    if not squat_df.empty:
+    if isinstance(squat_df, pd.DataFrame) and not squat_df.empty:
         st.markdown("### ⚠️ Failed Breakouts")
-        components.html(render_table(squat_df, "failed"), height=350)
+        components.html(render_table(squat_df, "failed"), height=420)
+
+with tab2:
+
+
+    current_ts, previous_ts = get_last_two_timestamps()
+
+    if not current_ts or not previous_ts:
+        st.warning("Not enough snapshot data yet.")
+        st.stop()
+
+    breakout_addition = []
+    breakdown_addition = []
+    breakout_deduction = []
+    breakdown_deduction = []
+
+    # 🔥 Breakout CE logic
+    for _, row in bullish_df.iterrows():
+
+        symbol = row["Symbol"]
+        ltp = row["LTP"]
+
+        oi_data = calculate_oi_change(symbol, "CE", current_ts, previous_ts)
+
+        if not oi_data.empty:
+            top3 = oi_data.head(3)
+
+            for _, r in top3.iterrows():
+
+                if r["oi_change"] > 0:
+                    breakout_addition.append({
+                        "Symbol": symbol,
+                        "Strike": r["strike"],
+                        "OI Change": r["oi_change"],
+                        "LTP": ltp
+                    })
+
+                elif r["oi_change"] < 0:
+                    breakout_deduction.append({
+                        "Symbol": symbol,
+                        "Strike": r["strike"],
+                        "OI Change": r["oi_change"],
+                        "LTP": ltp
+                    })
+
+    # 🔥 Breakdown PE logic
+    for _, row in bearish_df.iterrows():
+
+        symbol = row["Symbol"]
+        ltp = row["LTP"]
+
+        oi_data = calculate_oi_change(symbol, "PE", current_ts, previous_ts)
+
+        if not oi_data.empty:
+            top3 = oi_data.head(3)
+
+            for _, r in top3.iterrows():
+
+                if r["oi_change"] > 0:
+                    breakdown_addition.append({
+                        "Symbol": symbol,
+                        "Strike": r["strike"],
+                        "OI Change": r["oi_change"],
+                        "LTP": ltp
+                    })
+
+                elif r["oi_change"] < 0:
+                    breakdown_deduction.append({
+                        "Symbol": symbol,
+                        "Strike": r["strike"],
+                        "OI Change": r["oi_change"],
+                        "LTP": ltp
+                    })
 
 
 
+    breakout_addition_df = pd.DataFrame(breakout_addition) if breakout_addition else pd.DataFrame()
+    breakout_deduction_df = pd.DataFrame(breakout_deduction) if breakout_deduction else pd.DataFrame()
+    breakdown_addition_df = pd.DataFrame(breakdown_addition) if breakdown_addition else pd.DataFrame()
+    breakdown_deduction_df = pd.DataFrame(breakdown_deduction) if breakdown_deduction else pd.DataFrame()
 
+    # -----------------------------
+    st.markdown("### 🟢 Breakout CE OI Addition")
+    components.html(render_table(breakout_addition_df, "bullish"), height=420)
 
+    st.markdown("### 🟢 Breakout CE OI Deduction")
+    components.html(render_table(breakout_deduction_df, "bullish"), height=420)
+
+    # -----------------------------
+    st.markdown("### 🔴 Breakdown PE OI Addition")
+    components.html(render_table(breakdown_addition_df, "bearish"), height=420)
+
+    st.markdown("### 🔴 Breakdown PE OI Deduction")
+    components.html(render_table(breakdown_deduction_df, "bearish"), height=420)
 
 
 
@@ -1529,7 +1879,6 @@ with col2:
 #     if not squat_df.empty:
 #         st.markdown("### ⚠️ Failed Breakouts")
 #         components.html(render_table(squat_df, "failed"), height=350)
-
 
 
 
